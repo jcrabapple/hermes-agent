@@ -137,6 +137,10 @@ def _custom_provider_ssl_context(base_url: str):
 
 # Process-lifetime picker lists refreshed from the live catalogs (see fetch_*_models).
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
+# The same list plus every live tool-capable model the curated manifest omits, for
+# ``model_catalog.openrouter_full_catalog``. A separate slot so flipping the flag can never
+# serve the other mode's rows.
+_openrouter_catalog_full_cache: list[tuple[str, str]] | None = None
 
 # The in-memory ``_openrouter_catalog_cache`` is per-process, so without a disk cache every cold
 # picker open re-downloads the full ~686KB /api/v1/models catalog. The *curated* result
@@ -157,9 +161,14 @@ def _openrouter_catalog_disk_path() -> Path:
     return get_hermes_home() / "cache" / "openrouter_curated_catalog.json"
 
 
-def _read_openrouter_catalog_disk(*, allow_stale: bool = False) -> list[tuple[str, str]] | None:
-    """Fresh curated catalog from disk, or None (missing, corrupt, expired, or empty).
+def _read_openrouter_catalog_disk(
+    *, allow_stale: bool = False, full: bool = False,
+) -> list[tuple[str, str]] | None:
+    """Fresh picker catalog from disk, or None (missing, corrupt, expired, or empty).
 
+    ``full`` reads the uncurated-appended copy (``model_catalog.openrouter_full_catalog``); a
+    snapshot written before that mode existed carries no ``full`` key and reads as a miss, so the
+    next call fetches fresh instead of serving a half list.
     ``allow_stale`` ignores the TTL — the cache-only read path prefers a stale copy over a live GET."""
     obj = _read_json_cache(_openrouter_catalog_disk_path())
     if obj is None:
@@ -169,18 +178,22 @@ def _read_openrouter_catalog_disk(*, allow_stale: bool = False) -> list[tuple[st
             return None
     except (TypeError, ValueError):
         return None
-    items = obj.get("curated")
+    items = obj.get("full" if full else "curated")
     if not isinstance(items, list):
         return None
     out = [(str(it[0]), str(it[1])) for it in items if isinstance(it, (list, tuple)) and len(it) == 2]
     return out or None
 
 
-def _write_openrouter_catalog_disk(curated: list[tuple[str, str]]) -> None:
+def _write_openrouter_catalog_disk(
+    curated: list[tuple[str, str]], full: list[tuple[str, str]] | None = None,
+) -> None:
+    payload: dict[str, Any] = {"fetched_at": time.time(), "curated": [list(c) for c in curated]}
+    # Both modes are written from the same live fetch, so turning the flag on never needs a refetch.
+    if full is not None:
+        payload["full"] = [list(c) for c in full]
     try:
-        _write_json_cache(
-            _openrouter_catalog_disk_path(),
-            {"fetched_at": time.time(), "curated": [list(c) for c in curated]})
+        _write_json_cache(_openrouter_catalog_disk_path(), payload)
     except Exception as exc:
         logger.debug("openrouter curated catalog disk write failed: %s", exc)
 _ai_gateway_catalog_cache: list[tuple[str, str]] | None = None
@@ -650,16 +663,58 @@ def _fetch_live_catalog_index(url: str, timeout: float, opener) -> Optional[tupl
     return live_items, live_by_id
 
 
+def _openrouter_full_catalog_enabled() -> bool:
+    """``model_catalog.openrouter_full_catalog``: offer the live catalog's uncurated models too."""
+    try:
+        from hermes_cli.config import load_config
+
+        section = load_config().get("model_catalog")
+        return bool(section.get("openrouter_full_catalog")) if isinstance(section, dict) else False
+    except Exception:
+        logger.debug("openrouter_full_catalog flag unreadable; keeping the curated list", exc_info=True)
+        return False
+
+
+def _openrouter_uncurated_rows(live_items: list, curated_ids: set[str]) -> list[tuple[str, str]]:
+    """Live tool-capable models the curated manifest does not name, newest release first.
+
+    ``:batch`` SKUs are batch-API priced twins of a chat model and fail as interactive picks, so
+    they stay out even in full-catalog mode. Tool support is the same gate the curated rows pass,
+    because hermes-agent cannot drive a model that cannot call tools."""
+    rows: list[tuple[float, str, str]] = []
+    for item in live_items:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not isinstance(model_id, str) or not model_id or model_id in curated_ids or model_id.endswith(":batch"):
+            continue
+        if not _openrouter_model_supports_tools(item):
+            continue
+        try:
+            created = float(item.get("created") or 0)
+        except (TypeError, ValueError):
+            created = 0.0
+        rows.append((created, model_id, "free" if _openrouter_model_is_free(item.get("pricing")) else ""))
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    return [(model_id, desc) for _, model_id, desc in rows]
+
+
 def fetch_openrouter_models(
     timeout: float = 8.0, *, force_refresh: bool = False, cache_only: bool = False) -> list[tuple[str, str]]:
-    """Return the curated OpenRouter picker list, refreshed from the live catalog when possible.
+    """Return the OpenRouter picker list, refreshed from the live catalog when possible.
+
+    The curated manifest leads. With ``model_catalog.openrouter_full_catalog`` on, every live
+    tool-capable model the manifest omits is appended after it (newest first), so the picker offers
+    the provider's whole catalog instead of a maintainers' shortlist.
 
     ``cache_only`` never opens a socket: memory, then disk (stale accepted), then the in-repo snapshot."""
     # The curated list is filtered from this profile's manifest (``model_catalog.*`` config, its
     # ``<home>/cache`` copy), so a routed profile keeps its own slot instead of the module one.
     from hermes_cli.models_profile_cache import profile_slot_get, profile_slot_set
     _me = sys.modules[__name__]
-    cached = profile_slot_get(_me, "_openrouter_catalog_cache")
+    full = _openrouter_full_catalog_enabled()
+    slot = "_openrouter_catalog_full_cache" if full else "_openrouter_catalog_cache"
+    cached = profile_slot_get(_me, slot)
 
     if cached is not None and not force_refresh:
         return list(cached)
@@ -667,12 +722,14 @@ def fetch_openrouter_models(
     # Cold process: serve from the persisted disk cache when fresh so the
     # picker doesn't re-download the full ~686KB catalog on every open.
     if not force_refresh:
-        disk = _read_openrouter_catalog_disk(allow_stale=cache_only)
+        disk = _read_openrouter_catalog_disk(allow_stale=cache_only, full=full)
         if disk:
             if not cache_only:  # a stale copy is served, never memoized as fresh
-                profile_slot_set(_me, "_openrouter_catalog_cache", disk)
+                profile_slot_set(_me, slot, disk)
             return list(disk)
     if cache_only:
+        if full and (curated_disk := _read_openrouter_catalog_disk(allow_stale=True)):
+            return list(curated_disk)  # no full snapshot yet; curated beats the in-repo snapshot
         return list(OPENROUTER_MODELS)
 
     # Remote catalog manifest first, in-repo snapshot when unreachable; the live /v1/models filter
@@ -715,9 +772,11 @@ def fetch_openrouter_models(
         return list(cached or fallback)
     if not curated[0][1]:
         curated[0] = (curated[0][0], "recommended")
+    full_rows = curated + _openrouter_uncurated_rows(live_items, {mid for mid, _ in curated})
     profile_slot_set(_me, "_openrouter_catalog_cache", curated)
-    _write_openrouter_catalog_disk(curated)
-    return list(curated)
+    profile_slot_set(_me, "_openrouter_catalog_full_cache", full_rows)
+    _write_openrouter_catalog_disk(curated, full=full_rows)
+    return list(full_rows if full else curated)
 
 
 def model_ids(*, force_refresh: bool = False) -> list[str]:

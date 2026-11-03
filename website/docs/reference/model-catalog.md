@@ -83,6 +83,17 @@ model_catalog:
 
 Set `enabled: false` to disable remote fetch entirely and always use the in-repo snapshot (this also disables the gateway's background refresh). `ttl_minutes` sets both the cache lifetime and the gateway refresh cadence; the legacy `ttl_hours` key is still honoured if you set it explicitly.
 
+### Full OpenRouter catalog instead of the curated shortlist
+
+The manifest is a shortlist: OpenRouter serves several hundred models and only the ones maintainers curate appear in the pickers. Set `openrouter_full_catalog: true` to append every remaining live model that advertises tool-calling support after the curated rows, newest release first. Tool support is mandatory because hermes-agent cannot drive a model that cannot call tools; `:batch` SKUs stay out because they are batch-API priced twins that fail as interactive picks.
+
+```yaml
+model_catalog:
+  openrouter_full_catalog: true
+```
+
+This flows through `fetch_openrouter_models`, so every surface that reads the picker payload sees the full list: the Desktop Model Settings page (default, fallback chains, auxiliary slots, delegation), the TUI and CLI `/model` picker, and gateway clients using the `model.options` RPC or `GET /api/model/options` (the Android apps among them). An OpenAI-compatible client that only reads `GET /v1/models` still sees the routing alias list, not provider catalogs.
+
 ### Per-provider override URLs
 
 Third parties can self-host their own curation list using the same schema. Point a provider at a custom URL:

@@ -1504,6 +1504,85 @@ class TestOpenRouterCatalogDiskCache:
         assert len(calls) == 2
 
 
+class TestOpenRouterFullCatalogMode:
+    """``model_catalog.openrouter_full_catalog`` appends the live catalog's uncurated models.
+
+    The curated manifest is a shortlist, not the provider's catalog: everything OpenRouter serves
+    and the manifest omits (older releases, other vendors' families) used to be unselectable in every
+    picker that reads this list — desktop Model Settings (default/fallback/auxiliary), the TUI, and
+    gateway clients such as the Android apps, which all read the same payload.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset(self, monkeypatch):
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_full_cache", None)
+        yield
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_full_cache", None)
+
+    @staticmethod
+    def _install_network(monkeypatch):
+        items = [
+            {"id": "curated/lead", "created": 10, "pricing": {"prompt": "1", "completion": "1"},
+             "supported_parameters": ["tools"]},
+            {"id": "fresh/newest", "created": 400, "pricing": {"prompt": "1", "completion": "1"},
+             "supported_parameters": ["tools"]},
+            {"id": "fresh/older", "created": 200, "pricing": {"prompt": "1", "completion": "1"},
+             "supported_parameters": ["tools"]},
+            {"id": "fresh/free", "created": 100, "pricing": {"prompt": "0", "completion": "0"},
+             "supported_parameters": ["tools"]},
+            {"id": "fresh/no-tools", "created": 500, "pricing": {"prompt": "1", "completion": "1"},
+             "supported_parameters": ["completion"]},
+            {"id": "fresh/batched:batch", "created": 600, "pricing": {"prompt": "1", "completion": "1"},
+             "supported_parameters": ["tools"]},
+        ]
+        monkeypatch.setattr(
+            _models_mod, "_fetch_live_catalog_index",
+            lambda url, timeout, opener: (items, {m["id"]: m for m in items}))
+        monkeypatch.setattr("hermes_cli.model_catalog.get_curated_openrouter_models",
+                            lambda: [("curated/lead", "")])
+
+    @staticmethod
+    def _set_flag(monkeypatch, enabled: bool) -> None:
+        monkeypatch.setattr("hermes_cli.config.load_config",
+                            lambda: {"model_catalog": {"openrouter_full_catalog": enabled}})
+
+    def test_flag_off_serves_the_curated_list(self, monkeypatch):
+        self._install_network(monkeypatch)
+        self._set_flag(monkeypatch, False)
+        assert [mid for mid, _ in fetch_openrouter_models(force_refresh=True)] == ["curated/lead"]
+
+    def test_flag_on_appends_tool_capable_uncurated_models_newest_first(self, monkeypatch):
+        self._install_network(monkeypatch)
+        self._set_flag(monkeypatch, True)
+        rows = fetch_openrouter_models(force_refresh=True)
+        assert [mid for mid, _ in rows] == ["curated/lead", "fresh/newest", "fresh/older", "fresh/free"]
+        assert dict(rows)["fresh/free"] == "free"
+
+    def test_disk_snapshot_keeps_both_modes_apart(self, monkeypatch):
+        self._install_network(monkeypatch)
+        self._set_flag(monkeypatch, True)
+        full = fetch_openrouter_models(force_refresh=True)
+
+        _models_mod._openrouter_catalog_cache = None  # simulate a fresh process
+        _models_mod._openrouter_catalog_full_cache = None
+        assert fetch_openrouter_models(cache_only=True) == full
+
+        # Flipping the flag off must not hand the full list back as the curated one.
+        _models_mod._openrouter_catalog_full_cache = None
+        self._set_flag(monkeypatch, False)
+        assert [mid for mid, _ in fetch_openrouter_models()] == ["curated/lead"]
+
+    def test_full_mode_serves_curated_when_no_full_snapshot_exists_yet(self, monkeypatch):
+        self._install_network(monkeypatch)
+        self._set_flag(monkeypatch, True)
+        _models_mod._openrouter_catalog_disk_path().parent.mkdir(parents=True, exist_ok=True)
+        _models_mod._openrouter_catalog_disk_path().write_text(json.dumps(
+            {"fetched_at": time.time(), "curated": [["curated/lead", ""]]}))
+        assert [mid for mid, _ in fetch_openrouter_models(cache_only=True)] == ["curated/lead"]
+
+
 class TestAzureFoundryPickerCatalog:
     """``/model azure-foundry`` lists the resource's live ``/models`` ids (#27989).
 

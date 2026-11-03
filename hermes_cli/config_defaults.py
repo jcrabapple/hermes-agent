@@ -2032,6 +2032,10 @@ DEFAULT_CONFIG = {
         # Per-provider override URLs for self-hosted curation lists using the same schema, e.g.
         # providers: {openrouter: {url: https://example.com/my-curation.json}}.
         "providers": {},
+        # Offer OpenRouter's ENTIRE live catalog, not just the curated manifest: every model that
+        # advertises tool support is appended after the curated rows (newest release first).
+        # ``:batch`` SKUs stay out (batch-API pricing twins fail as interactive picks).
+        "openrouter_full_catalog": False,
     },
     # Per-model metadata overrides. Fields: context_window, supports_tools,
     # supports_vision, supports_reasoning, model_family. <provider>.<model_id> wins over

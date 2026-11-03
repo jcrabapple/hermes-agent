@@ -58,3 +58,21 @@ def test_genuinely_different_upstream_still_strips_overlaps():
     inventory._strip_aggregator_overlaps(rows)
     assert rows[0]["models"] == ["deepseek/deepseek-v4.1-flash"]
     assert rows[0]["total_models"] == 1
+
+
+def test_current_aggregator_keeps_its_catalog():
+    """The row the user is running on is never gutted by another configured provider's overlaps.
+
+    A broad reseller row (NanoGPT and friends list hundreds of OpenRouter-shaped ids) used to strip
+    most of the OpenRouter row, including when OpenRouter was the configured provider — the desktop
+    Model Settings page, the fallback/auxiliary pickers and gateway clients read this payload, so
+    they showed a near-empty OpenRouter list.
+    """
+    rows = [
+        _builtin_openrouter_row(["openai/gpt-6", "deepseek/deepseek-v4.1-flash"]),
+        _user_row("nanogpt", "https://nano-gpt.com/api/v1", ["openai/gpt-6", "anthropic/claude-opus-5"]),
+    ]
+    rows[0]["is_current"] = True
+    inventory._strip_aggregator_overlaps(rows)
+    assert rows[0]["models"] == ["openai/gpt-6", "deepseek/deepseek-v4.1-flash"]
+    assert rows[0]["total_models"] == 2

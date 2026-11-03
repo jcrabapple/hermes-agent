@@ -212,6 +212,12 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
     for row in rows:
         if row.get("is_user_defined") or not is_routing_aggregator(row.get("slug", "")):
             continue
+        # The row the user is actually running on keeps its whole catalog: a second configured
+        # provider that happens to list the same ids (a 600-model reseller) must not hide the
+        # models of the provider in use — that is the one row whose options are most needed, and
+        # picking from it routes exactly where the user expects.
+        if row.get("is_current"):
+            continue
         # Only strip overlaps from TRUE routing aggregators (OpenRouter, custom:* proxies). Flat-namespace
         # resellers (opencode-go / opencode-zen) serve every listed model as a first-party model, so their
         # rows must keep models that a user's proxy happens to share a name with — otherwise a subscription
